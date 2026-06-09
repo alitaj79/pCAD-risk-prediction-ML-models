@@ -1,0 +1,102 @@
+# Use the same train_bal and test_final you already have
+library(glmnet)
+# Define predictors and outcome as matrix/data.frame + factor
+train_x <- train_bal[, final_features, drop = FALSE]   # predictors only
+train_y <- train_bal$CAD_total                          # factor (No/Yes)
+
+# ==============================================
+# 1. 5‑fold CV control (same as before)
+# ==============================================
+ctrl_glm <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE,
+  verboseIter = FALSE
+)
+
+# ==============================================
+# 2. Train logistic regression with CV (no tuning)
+# ==============================================
+set.seed(123)
+glm_cv <- train(
+  x = train_x,                      # same predictors (train_bal[, final_features])
+  y = train_y,                      # factor (No/Yes)
+  method = "glm",
+  family = "binomial",              # logistic regression
+  metric = "ROC",
+  trControl = ctrl_glm
+)
+
+# CV performance
+glm_cv$results
+glm_cv$resample      # fold-by-fold metrics
+summary(glm_cv)      # shows coefficients, etc.
+
+# ==============================================
+# 3. Final logistic regression model
+# ==============================================
+final_glm <- train(
+  x = train_x,
+  y = train_y,
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "none")   # no re‑sampling
+)
+
+# ==============================================
+# 4. Test‑set evaluation
+# ==============================================
+pred_class_glm <- predict(final_glm, newdata = test_final)
+pred_prob_glm  <- predict(final_glm, newdata = test_final, type = "prob")
+
+# Confusion matrix
+cm_glm <- caret::confusionMatrix(pred_class_glm, test_final$CAD_total, positive = "Yes")
+cm_glm
+
+# AUC + 95% DeLong CI
+library(pROC)
+roc_glm <- roc(test_final$CAD_total, pred_prob_glm[, "Yes"],
+               levels = c("No", "Yes"), direction = "<")
+auc_ci_glm <- ci.auc(roc_glm, method = "delong")
+cat("Logistic Regression AUC (95% CI):", round(auc_ci_glm[2], 3),
+    "[", round(auc_ci_glm[1], 3), "-", round(auc_ci_glm[3], 3), "]\n")
+
+# ==============================================
+# 5. Bootstrap 95% CIs for all metrics
+# ==============================================
+get_metrics <- function(pred, ref) {
+  cm <- caret::confusionMatrix(pred, ref, positive = "Yes")
+  c(Accuracy      = cm$overall["Accuracy"],
+    Sensitivity   = cm$byClass["Sensitivity"],
+    Specificity   = cm$byClass["Specificity"],
+    PosPredValue  = cm$byClass["Pos Pred Value"],
+    NegPredValue  = cm$byClass["Neg Pred Value"],
+    BalancedAcc   = cm$byClass["Balanced Accuracy"])
+}
+
+set.seed(456)
+n_boot <- 1000
+boot_mat_glm <- matrix(NA, nrow = n_boot, ncol = 6)
+colnames(boot_mat_glm) <- c("Accuracy","Sensitivity","Specificity",
+                            "PosPredValue","NegPredValue","BalancedAcc")
+
+for(i in 1:n_boot) {
+  idx <- sample(nrow(test_final), replace = TRUE)
+  boot_pred <- pred_class_glm[idx]
+  boot_ref  <- test_final$CAD_total[idx]
+  boot_pred <- factor(boot_pred, levels = c("No", "Yes"))
+  boot_mat_glm[i, ] <- get_metrics(boot_pred, boot_ref)
+}
+
+ci_glm <- apply(boot_mat_glm, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+point_glm <- get_metrics(pred_class_glm, test_final$CAD_total)
+
+results_glm <- data.frame(
+  Metric     = names(point_glm),
+  Estimate   = round(point_glm, 3),
+  Lower_95CI = round(ci_glm[1, ], 3),
+  Upper_95CI = round(ci_glm[2, ], 3)
+)
+results_glm
