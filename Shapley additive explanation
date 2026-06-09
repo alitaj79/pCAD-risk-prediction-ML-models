@@ -1,0 +1,143 @@
+#Loading necessary package
+library(fastshap)
+
+# Predictor matrix (plain data.frame, no outcome)
+test_x <- as.data.frame(test_final[, final_features])
+
+# Prediction wrapper for class "Yes" probability
+pfun <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+set.seed(42)
+shap <- explain(
+  object = final_rf2,
+  X = test_x,
+  pred_wrapper = pfun,
+  nsim = 100,                # increase for more stable results (e.g., 500)
+  newdata = test_x
+)
+
+library(reshape2)   # for melt()
+library(dplyr)
+
+# Melt SHAP matrix
+shap_long <- melt(shap, varnames = c("observation", "feature"), value.name = "shap_value")
+
+# Melt feature matrix to match
+feat_long <- melt(as.matrix(test_x), varnames = c("observation", "feature"), value.name = "feature_value")
+
+# Join
+shap_data <- left_join(shap_long, feat_long, by = c("observation", "feature"))
+
+# Compute mean absolute SHAP value for ordering (global importance)
+feature_order <- shap_data %>%
+  group_by(feature) %>%
+  summarise(importance = mean(abs(shap_value))) %>%
+  arrange(desc(importance)) %>%
+  pull(feature)
+
+# Convert feature to factor with that order
+shap_data$feature <- factor(shap_data$feature, levels = rev(feature_order))
+
+library(ggplot2)
+library(ggbeeswarm)
+
+#Beeswarm plot
+p_beeswarm <- ggplot(shap_data, aes(x = shap_value, y = feature, color = feature_value)) +
+  geom_quasirandom(size = 0.5, alpha = 0.7, groupOnX = FALSE) +
+  scale_color_gradient(low = "blue", high = "red", name = "Feature value") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "SHAP Beeswarm Plot – Random Forest",
+    x = "SHAP value (impact on prediction)",
+    y = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.major.y = element_line(color = "grey90", size = 0.3),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) + theme_bw() + theme_classic()
+
+print(p_beeswarm)
+
+ggsave("shap_beeswarm_rf.tiff", p_beeswarm, width = 7, height = 5, dpi = 400)
+
+
+###################################################################
+#############     SHAP dependence plots            ################
+###################################################################
+
+# Create a directory to store individual plots
+dir.create("shap_dependence_plots", showWarnings = FALSE)
+
+# Get feature names from final_features (order as in shap_data)
+features <- levels(shap_data$feature)
+
+for (f in features) {
+  
+  sub <- filter(shap_data, feature == f)
+  
+  p <- ggplot(sub, aes(x = feature_value, y = shap_value)) +
+    geom_point(alpha = 0.4, size = 0.5) +
+    geom_smooth(method = "loess", se = TRUE, color = "red", size = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    labs(
+      title = paste("SHAP Dependence –", f),
+      x = "Feature value (standardized)",
+      y = "SHAP value"
+    ) +
+    theme_bw()
+  
+  ggsave(
+    filename = paste0("shap_dependence_plots/", f, ".tiff"),
+    plot = p, width = 5, height = 4, dpi = 400
+  )
+}
+
+
+###################################################################
+#############      SHAP waterfall plots            ################
+###################################################################
+
+# Ensure shapviz is up‑to‑date (needed for return_ggplot)
+# install.packages("shapviz")
+
+library(shapviz)
+library(ggplot2)
+
+dir.create("waterfall_plots", showWarnings = FALSE)
+
+for (case_name in names(case_ids)) {
+  
+  row_id <- case_ids[case_name]
+  
+  # Create the waterfall plot as a ggplot object
+  p <- sv_waterfall(
+    shp,
+    row_id = row_id,
+    max_display = 8,
+    size = 4,
+    fill_colors = c("#1B9E77", "#D95F02"),
+    return_ggplot = TRUE               # <-- this is the key
+  )
+  
+  # Optionally add a descriptive title
+  p <- p + labs(
+    title = paste0("SHAP Waterfall – ", case_name),
+    subtitle = paste0("Predicted probability: ", round(pred_yes[row_id], 3))
+  )
+  
+  # Save with ggsave
+  ggsave(
+    filename = paste0("waterfall_plots/", gsub(" ", "_", case_name), ".tiff"),
+    plot = p,
+    width = 7,
+    height = 5,
+    dpi = 400
+  )
+}
