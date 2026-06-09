@@ -1,0 +1,106 @@
+library(xgboost)
+# 5‑fold CV – same setup as RF, optimising ROC
+ctrl_xgb <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE,
+  verboseIter = FALSE
+)
+
+# Tuning grid – start with a reasonable small set
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6),
+  eta = c(0.01, 0.1),
+  gamma = c(0, 0.1),
+  colsample_bytree = c(0.6, 0.8),
+  min_child_weight = c(1, 5),
+  subsample = c(0.6, 0.8)
+)
+# This yields 2^7 = 128 combinations – if too slow, reduce to 64 by fixing some values.
+# For example, fix gamma=0, min_child_weight=1 and only vary the rest.
+
+set.seed(123)
+xgb_cv <- train(
+  CAD_total ~ .,
+  data = train_bal,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = ctrl_xgb,
+  tuneGrid = xgb_grid,
+  verbosity = 0   # suppress XGBoost output
+)
+
+# Best tune and CV performance
+xgb_cv$bestTune
+xgb_cv$results
+plot(xgb_cv)
+
+best_params <- xgb_cv$bestTune
+
+# Train final model on all of train_bal
+final_xgb <- train(
+  CAD_total ~ .,
+  data = train_bal,
+  method = "xgbTree",
+  trControl = trainControl(method = "none"),  # no re‑sampling
+  tuneGrid = best_params,
+  verbosity = 0
+)
+
+# Predictions
+pred_class_xgb <- predict(final_xgb, newdata = test_final)
+pred_prob_xgb  <- predict(final_xgb, newdata = test_final, type = "prob")
+
+# Confusion matrix – positive = "Yes"
+cm_xgb <- caret::confusionMatrix(pred_class_xgb, test_final$CAD_total, positive = "Yes")
+cm_xgb
+
+# AUC with 95% DeLong CI
+library(pROC)
+roc_xgb <- roc(test_final$CAD_total, pred_prob_xgb[, "Yes"],
+               levels = c("No", "Yes"), direction = "<")
+auc_ci_xgb <- ci.auc(roc_xgb, method = "delong")
+cat("XGBoost AUC (95% CI):", round(auc_ci_xgb[2], 3),
+    "[", round(auc_ci_xgb[1], 3), "-", round(auc_ci_xgb[3], 3), "]\n")
+
+get_metrics <- function(pred, ref) {
+  cm <- caret::confusionMatrix(pred, ref, positive = "Yes")
+  c(Accuracy      = cm$overall["Accuracy"],
+    Sensitivity   = cm$byClass["Sensitivity"],
+    Specificity   = cm$byClass["Specificity"],
+    PosPredValue  = cm$byClass["Pos Pred Value"],
+    NegPredValue  = cm$byClass["Neg Pred Value"],
+    BalancedAcc   = cm$byClass["Balanced Accuracy"])
+}
+
+set.seed(456)
+n_boot <- 1000
+boot_mat_xgb <- matrix(NA, nrow = n_boot, ncol = 6)
+colnames(boot_mat_xgb) <- c("Accuracy","Sensitivity","Specificity",
+                            "PosPredValue","NegPredValue","BalancedAcc")
+
+for(i in 1:n_boot) {
+  idx <- sample(nrow(test_final), replace = TRUE)
+  boot_pred <- pred_class_xgb[idx]
+  boot_ref  <- test_final$CAD_total[idx]
+  boot_pred <- factor(boot_pred, levels = c("No", "Yes"))
+  boot_mat_xgb[i, ] <- get_metrics(boot_pred, boot_ref)
+}
+
+ci_metrics_xgb <- apply(boot_mat_xgb, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+point_est_xgb <- get_metrics(pred_class_xgb, test_final$CAD_total)
+
+results_xgb <- data.frame(
+  Metric     = names(point_est_xgb),
+  Estimate   = round(point_est_xgb, 3),
+  Lower_95CI = round(ci_metrics_xgb[1, ], 3),
+  Upper_95CI = round(ci_metrics_xgb[2, ], 3)
+)
+results_xgb
+
+importance_xgb <- varImp(final_xgb, scale = FALSE)
+plot(importance_xgb, main = "XGBoost Feature Importance")
+print(importance_xgb)
