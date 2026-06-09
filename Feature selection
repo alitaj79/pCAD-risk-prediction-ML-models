@@ -1,0 +1,206 @@
+# Load required packages
+library(Boruta)         # Boruta feature selection
+library(randomForest)   # underlying random forest
+library(smotefamily)    # SMOTE (alternative: DMwR2)
+library(caret)          # for createDataPartition
+library(dplyr)          # data manipulation
+
+# ------------------------------
+# 1. Prepare the data
+# ------------------------------
+data <- mydata1
+
+# Ensure the outcome is a factor (Boruta expects a factor for classification)
+data$CAD_total <- as.factor(data$CAD_total)
+# Check levels: "no" should be first or set reference level if needed
+table(data$CAD_total)
+
+# ------------------------------
+# 2. Train / test split
+# ------------------------------
+set.seed(123)
+trainIndex <- createDataPartition(data$CAD_total, p = 0.8, list = FALSE)
+train_data <- data[trainIndex, ]
+test_data  <- data[-trainIndex, ]
+
+# Check proportions in training set
+prop.table(table(train_data$CAD_total))
+
+# Separate predictors and outcome for training
+X_train <- train_data %>% select(-CAD_total)
+y_train <- train_data$CAD_total
+
+# Keep a copy of the original (raw) test data for PREVENT
+test_original <- test_data
+# ------------------------------
+# 2b. Winsorize numeric predictors (only on training data, then apply to test)
+# ------------------------------
+# Define a winsorizing function
+winsorize <- function(x, lower = 0.01, upper = 0.99) {
+  low  <- quantile(x, probs = lower, na.rm = TRUE)
+  high <- quantile(x, probs = upper, na.rm = TRUE)
+  x[x < low]  <- low
+  x[x > high] <- high
+  return(x)
+}
+
+# Identify numeric columns (excluding the outcome)
+numeric_vars <- train_data %>%
+  select(-CAD_total) %>%
+  select(where(is.numeric)) %>%
+  colnames()
+
+# For each numeric column, compute the winsorization limits from train_data,
+# then apply them to both train_data and test_data
+for (var in numeric_vars) {
+  # Compute limits on training data
+  low  <- quantile(train_data[[var]], probs = 0.01, na.rm = TRUE)
+  high <- quantile(train_data[[var]], probs = 0.99, na.rm = TRUE)
+  
+  # Apply to training
+  train_data[[var]][train_data[[var]] < low] <- low
+  train_data[[var]][train_data[[var]] > high] <- high
+  
+  # Apply same limits to test
+  test_data[[var]][test_data[[var]] < low] <- low
+  test_data[[var]][test_data[[var]] > high] <- high
+}
+# ------------------------------
+# 3. Boruta with class balancing (no SMOTE)
+# ------------------------------
+# We balance the random forest by drawing an equal number of samples
+# from each class for every tree. This prevents majority bias without
+# creating synthetic instances.
+minority_count <- min(table(y_train))  # number of "yes" in train
+
+# Use sampsize to give exactly 'minority_count' examples of each class per tree
+set.seed(456)
+boruta_output <- Boruta(
+  x = X_train,
+  y = y_train,
+  doTrace = 2,                       # verbose output
+  maxRuns = 100,                     # default, adjust if needed
+  # Pass arguments to randomForest():
+  sampsize = c(minority_count, minority_count)  # balanced bootstrap samples
+)
+
+# Print and plot results
+print(boruta_output)
+plot(boruta_output, las = 2, cex.axis = 0.7)
+
+# Tentative fix: you can resolve tentative attributes with TentativeRoughFix()
+boruta_final <- TentativeRoughFix(boruta_output)
+print(boruta_final)
+
+# Get the names of confirmed + tentative features (selected)
+selected_features <- getSelectedAttributes(boruta_final, withTentative = TRUE)
+cat("Selected features:", selected_features, "\n")
+
+# ------------------------------
+# 4. Apply SMOTE only on the training set (after feature selection)
+# ------------------------------
+# Reduce training data to selected features + outcome
+train_sel <- train_data[, c(selected_features, "CAD_total")]
+
+# SMOTE: k = 5 neighbours, balance to 50:50 (or any ratio you like)
+set.seed(789)
+smote_result <- SMOTE(
+  X = train_sel %>% select(-CAD_total),
+  target = train_sel$CAD_total,
+  K = 5,
+  dup_size = 0   # automatically oversample minority to match majority size
+)
+
+# Reconstruct the balanced training set
+train_balanced <- smote_result$data
+names(train_balanced)[names(train_balanced) == "class"] <- "CAD_total"
+train_balanced$CAD_total <- as.factor(train_balanced$CAD_total)
+
+# Check new class balance
+table(train_balanced$CAD_total)
+
+library(glmnet)   # LASSO
+library(caret)    # for createDataPartition (already loaded)
+
+# Build predictor matrix (model.matrix handles factors correctly)
+X <- model.matrix(CAD_total ~ . - 1, data = train_data)  # -1 removes intercept, glmnet adds its own
+y <- train_data$CAD_total
+
+# For glmnet, y must be a numeric vector (0/1)
+y_numeric <- ifelse(y == "1", 1, 0)
+
+# Compute weights: minority class gets higher weight
+n_total <- nrow(train_data)
+n_ones <- sum(y_numeric == 1)
+n_zeros <- n_total - n_ones
+weight_1 <- n_total / (2 * n_ones)
+weight_0 <- n_total / (2 * n_zeros)
+weights <- ifelse(y_numeric == 1, weight_1, weight_0)
+
+# Check
+table(y_numeric, weights)
+
+set.seed(123)
+cv_lasso <- cv.glmnet(
+  X, y_numeric,
+  family = "binomial",
+  weights = weights,          # apply class weights
+  alpha = 1,                  # LASSO
+  nfolds = 10,
+  type.measure = "deviance",  # or "class" for misclassification
+  standardize = TRUE          # always standardize for LASSO
+)
+
+# Plot cross‑validation curve
+plot(cv_lasso)
+
+# Conservative: lambda.1se
+lambda_opt <- cv_lasso$lambda.1se
+cat("Chosen lambda (1se):", lambda_opt, "\n")
+
+# Coefficients at chosen lambda
+coef_opt <- coef(cv_lasso, s = lambda_opt)
+
+# Extract names of non‑zero features (excluding intercept)
+selected_lasso <- rownames(coef_opt)[which(coef_opt != 0)]
+selected_lasso <- setdiff(selected_lasso, "(Intercept)")
+
+cat("\nFeatures selected by LASSO:\n")
+print(selected_lasso)
+
+# From your Boruta run (make sure selected_features exists)
+boruta_feats <- selected_features   # we already have this from earlier
+
+# Intersection – features agreed upon by both
+final_features <- intersect(boruta_feats, selected_lasso)
+
+cat("\nFeatures selected by BOTH Boruta and LASSO:\n")
+print(final_features)
+
+# ==============================================
+# 1. Prepare training set with FINAL features + SMOTE
+# ==============================================
+train_final <- train_data[, c(final_features, "CAD_total")]
+
+set.seed(789)
+smote_final <- SMOTE(
+  X = train_final %>% select(-CAD_total),
+  target = train_final$CAD_total,
+  K = 5,
+  dup_size = 0
+)
+train_bal <- smote_final$data
+names(train_bal)[names(train_bal) == "class"] <- "CAD_total"
+train_bal$CAD_total <- as.factor(train_bal$CAD_total)
+
+# Check balance
+table(train_bal$CAD_total)
+
+# ── FIX: rename levels to valid R names ─────────────────────────────
+levels(train_bal$CAD_total) <- c("No", "Yes")   # "0" -> "No", "1" -> "Yes"
+
+# Also update the test set to use the same level names
+test_final <- test_data[, c(final_features, "CAD_total")]
+levels(test_final$CAD_total) <- c("No", "Yes")  # must match exactly
+
+
